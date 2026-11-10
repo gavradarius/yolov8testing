@@ -1,0 +1,419 @@
+"""
+Pusat Koneksi dan Operasi Database PostgreSQL
+Sistem Absensi Mahasiswa Berbasis YOLOv11 & InsightFace
+
+Menyediakan fungsi standar:
+- get_connection()
+- test_connection()
+- create_tables()
+- get_mahasiswa()
+- save_face_data()
+- get_face_data()
+- save_absensi()
+- close_connection()
+"""
+
+import uuid
+import datetime
+import numpy as np
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+import config
+
+
+def get_connection():
+    """
+    Membuka dan mengembalikan koneksi baru ke database PostgreSQL
+    sesuai kredensial di config.py / .env.
+    """
+    conn = psycopg2.connect(
+        host=config.DB_HOST,
+        port=config.DB_PORT,
+        database=config.DB_NAME,
+        user=config.DB_USER,
+        password=config.DB_PASSWORD,
+        connect_timeout=5
+    )
+    try:
+        conn.set_client_encoding("UTF8")
+    except Exception:
+        pass
+    return conn
+
+
+def close_connection(conn):
+    """Menutup koneksi database secara aman."""
+    if conn and not conn.closed:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def test_connection():
+    """
+    Menguji konektivitas ke server PostgreSQL.
+    Returns: (bool, str) -> (status_sukses, pesan_keterangan)
+    """
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT version();")
+            versi = cur.fetchone()[0]
+        close_connection(conn)
+        return True, f"Terhubung ke PostgreSQL: {versi}"
+    except Exception as e:
+        return False, str(e)
+
+
+# Alias fungsi untuk kompatibilitas
+uji_koneksi = test_connection
+
+
+def generate_short_id(prefix="AB"):
+    """
+    Membuat ID unik acak dengan panjang maksimal 11 karakter
+    untuk memenuhi tipe VARCHAR(11) pada Primary Key tabel.
+    Format: 2 huruf kapital prefix + 9 karakter heksadesimal = 11 karakter.
+    Contoh: 'AB8A1F3C90D'
+    """
+    clean_prefix = prefix[:2].upper()
+    random_hex = uuid.uuid4().hex[:9].upper()
+    return f"{clean_prefix}{random_hex}"
+
+
+def create_tables(drop_existing=False):
+    """
+    Membuat 6 tabel PostgreSQL sesuai urutan Foreign Key:
+    1. t_mahasiswa
+    2. t_users
+    3. t_jadwal
+    4. t_absensi
+    5. t_pengaduan
+    6. t_datawajah
+    """
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cursor:
+                if drop_existing:
+                    # Hapus tabel lama jika ada migrasi ulang (urutan terbalik relasi FK)
+                    cursor.execute("DROP TABLE IF EXISTS t_pengaduan CASCADE;")
+                    cursor.execute("DROP TABLE IF EXISTS t_datawajah CASCADE;")
+                    cursor.execute("DROP TABLE IF EXISTS t_absensi CASCADE;")
+                    cursor.execute("DROP TABLE IF EXISTS t_jadwal CASCADE;")
+                    cursor.execute("DROP TABLE IF EXISTS t_users CASCADE;")
+                    cursor.execute("DROP TABLE IF EXISTS t_mahasiswa CASCADE;")
+
+                    # Bersihkan tabel format lama
+                    cursor.execute("DROP TABLE IF EXISTS mahasiswa CASCADE;")
+                    cursor.execute("DROP TABLE IF EXISTS prodi CASCADE;")
+
+                # 1. Tabel Master Mahasiswa
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS t_mahasiswa (
+                        nim VARCHAR(11) PRIMARY KEY,
+                        nama VARCHAR(255),
+                        tingkat VARCHAR(255),
+                        program_studi VARCHAR(255)
+                    );
+                """)
+
+                # 2. Tabel Master Users (Dosen / Admin)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS t_users (
+                        id_users VARCHAR(11) PRIMARY KEY,
+                        nama VARCHAR(255),
+                        password VARCHAR(255),
+                        email VARCHAR(255),
+                        role VARCHAR(11)
+                    );
+                """)
+
+                # 3. Tabel Jadwal Kuliah (FK ke t_users)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS t_jadwal (
+                        id_jadwal VARCHAR(11) PRIMARY KEY,
+                        id_users VARCHAR(11),
+                        kode_matkul VARCHAR(255),
+                        nama_matkul VARCHAR(22),
+                        ruang_kelas VARCHAR(255),
+                        sks INT,
+                        hari VARCHAR(11),
+                        jam_mulai TIME,
+                        jam_selesai TIME,
+                        FOREIGN KEY (id_users) REFERENCES t_users(id_users)
+                    );
+                """)
+
+                # 4. Tabel Absensi (FK ke t_mahasiswa & t_jadwal)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS t_absensi (
+                        id_absensi VARCHAR(11) PRIMARY KEY,
+                        nim VARCHAR(11),
+                        id_jadwal VARCHAR(11),
+                        tanggal DATE,
+                        waktu_absen TIME,
+                        status_kehadiran VARCHAR(255),
+                        FOREIGN KEY (nim) REFERENCES t_mahasiswa(nim),
+                        FOREIGN KEY (id_jadwal) REFERENCES t_jadwal(id_jadwal)
+                    );
+                """)
+
+                # 5. Tabel Pengaduan (FK ke t_mahasiswa, t_jadwal, & t_absensi)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS t_pengaduan (
+                        id_pengaduan VARCHAR(11) PRIMARY KEY,
+                        nim VARCHAR(11),
+                        id_jadwal VARCHAR(11),
+                        id_absensi VARCHAR(11),
+                        jenis_kendala VARCHAR(255),
+                        status_pengaduan VARCHAR(255),
+                        FOREIGN KEY (nim) REFERENCES t_mahasiswa(nim),
+                        FOREIGN KEY (id_jadwal) REFERENCES t_jadwal(id_jadwal),
+                        FOREIGN KEY (id_absensi) REFERENCES t_absensi(id_absensi)
+                    );
+                """)
+
+                # 6. Tabel Data Wajah (FK ke t_mahasiswa)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS t_datawajah (
+                        id_datawajah VARCHAR(11) PRIMARY KEY,
+                        nim VARCHAR(11),
+                        referensi_foto BYTEA,
+                        face_embedding BYTEA,
+                        FOREIGN KEY (nim) REFERENCES t_mahasiswa(nim)
+                    );
+                """)
+
+                # Indeks pencarian
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_datawajah_nim ON t_datawajah(nim);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_absensi_nim_tgl ON t_absensi(nim, tanggal);")
+
+        return True, "Enam tabel skema PostgreSQL berhasil dibuat sesuai relasi Foreign Key."
+    finally:
+        close_connection(conn)
+
+
+# Alias fungsi untuk kompatibilitas
+buat_skema_database = create_tables
+
+
+def get_mahasiswa(nim=None):
+    """
+    Mengambil data mahasiswa dari tabel t_mahasiswa.
+    - Jika nim diberikan: mengembalikan dict mahasiswa atau None jika tidak ditemukan.
+    - Jika nim None: mengembalikan list dict seluruh mahasiswa.
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if nim:
+                cur.execute("""
+                    SELECT nim, nama, tingkat, program_studi
+                    FROM t_mahasiswa
+                    WHERE nim = %s;
+                """, (nim,))
+                return cur.fetchone()
+            else:
+                cur.execute("""
+                    SELECT nim, nama, tingkat, program_studi
+                    FROM t_mahasiswa
+                    ORDER BY nim ASC;
+                """)
+                return cur.fetchall()
+    finally:
+        close_connection(conn)
+
+
+def save_face_data(nim, foto_bytes, embedding_array, id_datawajah=None):
+    """
+    Menyimpan data wajah (foto BYTEA dan face_embedding BYTEA) ke t_datawajah.
+    - nim: NIM mahasiswa (harus sudah terdaftar di t_mahasiswa).
+    - foto_bytes: binary file citra asli (.jpg/.png).
+    - embedding_array: numpy ndarray float32 (512 dimensi).
+    """
+    if not id_datawajah:
+        id_datawajah = generate_short_id(prefix="DW")
+
+    # Konversi array numpy float32 ke biner mentah (2048 bytes untuk 512 float32)
+    embedding_bytes = embedding_array.astype(np.float32).tobytes()
+
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # Periksa apakah NIM valid di t_mahasiswa
+                cur.execute("SELECT 1 FROM t_mahasiswa WHERE nim = %s;", (nim,))
+                if not cur.fetchone():
+                    raise ValueError(f"NIM {nim} belum terdaftar di t_mahasiswa!")
+
+                # Hapus data wajah lama milik NIM ini untuk mencegah duplikasi
+                cur.execute("DELETE FROM t_datawajah WHERE nim = %s;", (nim,))
+
+                # Insert data wajah baru
+                cur.execute("""
+                    INSERT INTO t_datawajah (id_datawajah, nim, referensi_foto, face_embedding)
+                    VALUES (%s, %s, %s, %s);
+                """, (
+                    id_datawajah,
+                    nim,
+                    psycopg2.Binary(foto_bytes) if foto_bytes else None,
+                    psycopg2.Binary(embedding_bytes)
+                ))
+
+        return True, id_datawajah
+    finally:
+        close_connection(conn)
+
+
+def get_face_data():
+    """
+    Mengambil data wajah dari t_datawajah di-JOIN ke t_mahasiswa.
+    Format BYTEA dikonversikan kembali menjadi NumPy float32 array.
+    Returns: list of dict -> [{id_datawajah, nim, nama, program_studi, embedding, foto_bytes}]
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            query = """
+                SELECT 
+                    d.id_datawajah,
+                    d.nim,
+                    m.nama,
+                    m.program_studi,
+                    d.face_embedding,
+                    d.referensi_foto
+                FROM t_datawajah d
+                JOIN t_mahasiswa m ON d.nim = m.nim
+                WHERE d.face_embedding IS NOT NULL;
+            """
+            cur.execute(query)
+            rows = cur.fetchall()
+
+            daftar_referensi = []
+            for row in rows:
+                id_dw, nim, nama, prodi, emb_bytes, foto_b = row
+                # Konversi biner BYTEA ke numpy array float32
+                embedding_array = np.frombuffer(emb_bytes, dtype=np.float32)
+
+                daftar_referensi.append({
+                    "id_datawajah": id_dw,
+                    "nim": nim,
+                    "nama": nama,
+                    "prodi": prodi,
+                    "embedding": embedding_array,
+                    "foto_bytes": foto_b
+                })
+
+            return daftar_referensi
+    finally:
+        close_connection(conn)
+
+
+# Alias fungsi untuk kompatibilitas
+muat_referensi_wajah = get_face_data
+
+
+def dapatkan_jadwal_aktif():
+    """
+    Mendapatkan id_jadwal yang sedang aktif berdasarkan hari dan jam saat ini.
+    Jika tidak ada jadwal yang sesuai saat ini, mengembalikan None (tidak membuat jadwal fiktif).
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            hari_map = {
+                0: "Senin", 1: "Selasa", 2: "Rabu",
+                3: "Kamis", 4: "Jumat", 5: "Sabtu", 6: "Minggu"
+            }
+            sekarang = datetime.datetime.now()
+            nama_hari = hari_map.get(sekarang.weekday(), "Senin")
+            waktu_str = sekarang.strftime("%H:%M:%S")
+
+            cur.execute("""
+                SELECT id_jadwal, kode_matkul, nama_matkul, ruang_kelas, jam_mulai, jam_selesai
+                FROM t_jadwal
+                WHERE LOWER(hari) = LOWER(%s)
+                  AND %s BETWEEN jam_mulai AND jam_selesai
+                LIMIT 1;
+            """, (nama_hari, waktu_str))
+            return cur.fetchone()
+    finally:
+        close_connection(conn)
+
+
+def save_absensi(nim, id_jadwal, status_kehadiran="Hadir", tanggal=None, waktu_absen=None, cek_duplikasi=True):
+    """
+    Menyimpan catatan absensi ke tabel t_absensi.
+    - id_jadwal wajib valid (tidak boleh None atau fiktif).
+    - Menghasilkan id_absensi unik (maksimal 11 karakter).
+    - Memiliki validasi duplikasi absensi hari ini.
+    """
+    if not id_jadwal:
+        raise ValueError("id_jadwal tidak boleh kosong atau belum tersedia!")
+
+    sekarang = datetime.datetime.now()
+    tgl = tanggal or sekarang.date()
+    wkt = waktu_absen or sekarang.time().replace(microsecond=0)
+
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # 1. Pastikan mahasiswa terdaftar
+                cur.execute("SELECT 1 FROM t_mahasiswa WHERE nim = %s;", (nim,))
+                if not cur.fetchone():
+                    raise ValueError(f"Mahasiswa dengan NIM {nim} belum terdaftar di t_mahasiswa!")
+
+                # 2. Pastikan id_jadwal valid di t_jadwal
+                cur.execute("SELECT 1 FROM t_jadwal WHERE id_jadwal = %s;", (id_jadwal,))
+                if not cur.fetchone():
+                    raise ValueError(f"Jadwal {id_jadwal} tidak terdaftar di t_jadwal!")
+
+                # 3. Pencegahan duplikasi absensi pada hari & jadwal yang sama
+                if cek_duplikasi:
+                    cur.execute("""
+                        SELECT id_absensi FROM t_absensi 
+                        WHERE nim = %s AND id_jadwal = %s AND tanggal = %s
+                        LIMIT 1;
+                    """, (nim, id_jadwal, tgl))
+                    existing = cur.fetchone()
+                    if existing:
+                        return {
+                            "status": "sudah_absen",
+                            "id_absensi": existing[0],
+                            "pesan": f"NIM {nim} sudah tercatat hadir pada jadwal ini hari ini."
+                        }
+
+                id_absensi = generate_short_id(prefix="AB")
+                cur.execute("""
+                    INSERT INTO t_absensi (
+                        id_absensi, nim, id_jadwal, tanggal, waktu_absen, status_kehadiran
+                    ) VALUES (%s, %s, %s, %s, %s, %s);
+                """, (
+                    id_absensi,
+                    nim,
+                    id_jadwal,
+                    tgl,
+                    wkt,
+                    status_kehadiran
+                ))
+
+        return {
+            "status": "berhasil",
+            "id_absensi": id_absensi,
+            "nim": nim,
+            "id_jadwal": id_jadwal,
+            "tanggal": str(tgl),
+            "waktu_absen": str(wkt),
+            "status_kehadiran": status_kehadiran,
+            "pesan": f"Absensi berhasil dicatat untuk NIM {nim}."
+        }
+    finally:
+        close_connection(conn)
+
+
+# Alias fungsi untuk kompatibilitas
+catat_absensi = save_absensi
