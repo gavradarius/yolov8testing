@@ -1,0 +1,307 @@
+"""
+Modul Registrasi Wajah Mahasiswa ke Database PostgreSQL
+Membaca dataset foto dari folder data_uji atau data_wajah, memvalidasi identitas via CSV/JSON,
+mendeteksi wajah, mengekstrak embedding via InsightFace, dan menyimpan foto asli (BYTEA)
+serta embedding wajah (BYTEA) ke tabel t_mahasiswa dan t_datawajah.
+"""
+
+import os
+import csv
+import json
+import argparse
+from pathlib import Path
+import numpy as np
+from insightface.app import FaceAnalysis
+
+import config
+from database import (
+    get_connection,
+    close_connection,
+    get_mahasiswa,
+    save_face_data,
+    test_connection
+)
+
+VALID_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+
+
+def muat_metadata_identitas(folder_path: Path):
+    """
+    Mencari dan membaca file metadata identitas mahasiswa (CSV atau JSON)
+    jika tersedia di folder data atau root project.
+    Format return: {nim: {"nama": str, "tingkat": str, "prodi": str}}
+    """
+    metadata = {}
+
+    # 1. Cek file CSV (mahasiswa.csv)
+    opsi_csv = [
+        folder_path / "mahasiswa.csv",
+        config.BASE_DIR / "mahasiswa.csv",
+        folder_path.parent / "mahasiswa.csv",
+        config.BASE_DIR / "data_wajah" / "mahasiswa.csv",
+        config.BASE_DIR / "data_uji" / "mahasiswa.csv"
+    ]
+    for path_csv in opsi_csv:
+        if path_csv.exists():
+            print(f" [INFO] Memuat metadata identitas dari CSV: {path_csv.name}")
+            with open(path_csv, mode="r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    nim = row.get("NIM") or row.get("nim")
+                    nama = row.get("nama") or row.get("Nama")
+                    tingkat = row.get("tingkat") or row.get("Tingkat", "Tingkat 3")
+                    prodi = row.get("Program_studi") or row.get("program_studi") or row.get("prodi", "Rekayasa Perangkat Lunak")
+                    if nim and nama:
+                        metadata[str(nim).strip()] = {
+                            "nama": str(nama).strip(),
+                            "tingkat": str(tingkat).strip(),
+                            "prodi": str(prodi).strip()
+                        }
+            if metadata:
+                return metadata
+
+    # 2. Cek file JSON jika CSV tidak ditemukan
+    opsi_json = [
+        folder_path / "mahasiswa.json",
+        config.BASE_DIR / "data_wajah" / "mahasiswa.json",
+        config.BASE_DIR / "mahasiswa.json"
+    ]
+    for path_json in opsi_json:
+        if path_json.exists():
+            print(f" [INFO] Memuat metadata identitas dari JSON: {path_json.name}")
+            with open(path_json, mode="r", encoding="utf-8") as f:
+                data_json = json.load(f)
+                for nim, val in data_json.items():
+                    metadata[str(nim).strip()] = {
+                        "nama": val.get("nama", "").strip(),
+                        "tingkat": val.get("tingkat", "Tingkat 3").strip(),
+                        "prodi": val.get("prodi", "Rekayasa Perangkat Lunak").strip()
+                    }
+            if metadata:
+                return metadata
+
+    return metadata
+
+
+def inisialisasi_insightface():
+    """Inisialisasi model ekstraksi fitur wajah InsightFace."""
+    print(" [AI] Memuat InsightFace (buffalo_l)...")
+    app = FaceAnalysis(
+        name="buffalo_l",
+        root=str(config.MODELS_CACHE_DIR),
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+    )
+    app.prepare(ctx_id=-1, det_size=(config.DETECTION_SIZE, config.DETECTION_SIZE))
+    return app
+
+
+def pastikan_mahasiswa_terdaftar(nim, metadata):
+    """
+    Memastikan data mahasiswa terdaftar di tabel t_mahasiswa.
+    Jika belum ada, menggunakan data sah dari CSV/JSON.
+    Jangan membuat data identitas fiktif jika tidak ada di sumber sah.
+    """
+    mhs_db = get_mahasiswa(nim)
+    if mhs_db:
+        return True, mhs_db["nama"], mhs_db["tingkat"], mhs_db["program_studi"]
+
+    # Jika belum ada di t_mahasiswa, cek di metadata CSV/JSON
+    if nim in metadata:
+        identitas = metadata[nim]
+        nama = identitas["nama"]
+        tingkat = identitas["tingkat"]
+        prodi = identitas["prodi"]
+
+        # Insert ke t_mahasiswa
+        conn = get_connection()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO t_mahasiswa (nim, nama, tingkat, program_studi)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (nim) DO NOTHING;
+                    """, (nim, nama, tingkat, prodi))
+            return True, nama, tingkat, prodi
+        finally:
+            close_connection(conn)
+
+    return False, None, None, None
+
+
+def registrasi_dataset_wajah(folder_dataset: str = None, simpan_ke_db: bool = True):
+    """
+    Memproses seluruh subfolder foto mahasiswa di folder data_uji atau data_wajah.
+    - Format folder: <folder_dataset>/<NIM>/<foto>
+    - Membaca dan memvalidasi citra menggunakan imread_unicode.
+    - Menolak foto yang tidak terbaca, 0 wajah, atau > 1 wajah.
+    - Menghasilkan normalized face embedding 512 dimensi.
+    - Menyimpan ke PostgreSQL secara transaksional (foto BYTEA + embedding BYTEA).
+    """
+    target_dir = Path(folder_dataset) if folder_dataset else None
+
+    if not target_dir or not target_dir.exists():
+        # Coba data_uji terlebih dahulu, lalu data_wajah
+        opsi_dir = [
+            config.BASE_DIR / "data_uji",
+            config.BASE_DIR / "data_wajah",
+            Path("data_uji"),
+            Path("data_wajah")
+        ]
+        for d in opsi_dir:
+            if d.exists() and d.is_dir():
+                target_dir = d
+                break
+
+    if not target_dir or not target_dir.exists():
+        raise FileNotFoundError("Direktori dataset foto (data_uji / data_wajah) tidak ditemukan.")
+
+    print("=" * 65)
+    print(f" REGISTRASI DATASET FOTO MAHASISWA DARI: {target_dir.resolve()}")
+    print("=" * 65)
+
+    metadata_identitas = muat_metadata_identitas(target_dir)
+    app = inisialisasi_insightface()
+
+    laporan_sukses = []
+    laporan_gagal = []
+
+    # Ambil subfolder NIM
+    subfolders = [d for d in target_dir.iterdir() if d.is_dir()]
+    if not subfolders:
+        print(f" [!] Tidak ditemukan subfolder NIM di {target_dir}")
+        return laporan_sukses, laporan_gagal
+
+    for subfolder in subfolders:
+        nim = subfolder.name.strip()
+
+        # Validasi ketersediaan identitas sah di t_mahasiswa atau CSV/JSON
+        terdaftar, nama, tingkat, prodi = pastikan_mahasiswa_terdaftar(nim, metadata_identitas)
+        if not terdaftar:
+            laporan_gagal.append({
+                "nim": nim,
+                "alasan": f"NIM {nim} tidak memiliki data identitas yang valid di t_mahasiswa maupun CSV/JSON (Registrasi ditolak)."
+            })
+            print(f"\n [DITOLAK] NIM: {nim} -> Tidak memiliki data identitas valid.")
+            continue
+
+        print(f"\n[*] Memproses: {nim} - {nama} [{prodi}]")
+
+        list_embedding = []
+        foto_referensi_biner = None
+        foto_berhasil_hitung = 0
+        foto_gagal_hitung = 0
+
+        # Cari file foto
+        file_foto_list = [f for f in subfolder.iterdir() if f.is_file() and f.suffix.lower() in VALID_EXTENSIONS]
+
+        if not file_foto_list:
+            laporan_gagal.append({
+                "nim": nim,
+                "nama": nama,
+                "alasan": "Tidak ada file foto berekstensi .jpg, .jpeg, atau .png di folder ini."
+            })
+            print(f"  [-] Tidak ada foto valid untuk {nim}")
+            continue
+
+        for foto_path in file_foto_list:
+            # 1. Baca gambar dengan aman (mendukung path Unicode Windows)
+            gambar = config.imread_unicode(foto_path)
+            if gambar is None:
+                foto_gagal_hitung += 1
+                print(f"  [X] Gagal membaca citra: {foto_path.name}")
+                continue
+
+            # 2. Deteksi wajah
+            wajah_list = app.get(gambar)
+
+            # 3. Validasi jumlah wajah (harus tepat 1 wajah)
+            if len(wajah_list) == 0:
+                foto_gagal_hitung += 1
+                print(f"  [X] {foto_path.name}: Tidak ada wajah terdeteksi (Ditolak)")
+                continue
+
+            if len(wajah_list) > 1:
+                foto_gagal_hitung += 1
+                print(f"  [X] {foto_path.name}: Terdeteksi {len(wajah_list)} wajah (Ditolak - Banyak wajah)")
+                continue
+
+            # 4. Ambil normalized embedding
+            wajah = wajah_list[0]
+            list_embedding.append(wajah.normed_embedding)
+            foto_berhasil_hitung += 1
+
+            # Simpan foto pertama yang valid sebagai referensi_foto BYTEA
+            if foto_referensi_biner is None:
+                with open(foto_path, "rb") as f_img:
+                    foto_referensi_biner = f_img.read()
+
+            print(f"  [+] {foto_path.name}: 1 Wajah teridentifikasi (det_score: {wajah.det_score:.3f})")
+
+        if not list_embedding:
+            laporan_gagal.append({
+                "nim": nim,
+                "nama": nama,
+                "alasan": "Semua foto ditolak karena tidak memenuhi syarat tepat 1 wajah."
+            })
+            continue
+
+        # 5. Gabungkan vektor rata-rata dan normalisasi L2
+        vektor_gabungan = np.mean(list_embedding, axis=0)
+        vektor_final = vektor_gabungan / np.linalg.norm(vektor_gabungan)
+
+        # 6. Simpan ke database PostgreSQL
+        if simpan_ke_db:
+            try:
+                sukses, id_dw = save_face_data(
+                    nim=nim,
+                    foto_bytes=foto_referensi_biner,
+                    embedding_array=vektor_final
+                )
+                laporan_sukses.append({
+                    "nim": nim,
+                    "nama": nama,
+                    "id_datawajah": id_dw,
+                    "foto_valid": foto_berhasil_hitung,
+                    "foto_gagal": foto_gagal_hitung
+                })
+                print(f"  [DATABASE SUCCESS] Disimpan ke t_datawajah (ID: {id_dw}) | Valid: {foto_berhasil_hitung}, Gagal: {foto_gagal_hitung}")
+            except Exception as e:
+                laporan_gagal.append({
+                    "nim": nim,
+                    "nama": nama,
+                    "alasan": f"Gagal simpan ke t_datawajah: {e}"
+                })
+                print(f"  [DATABASE ERROR]: {e}")
+        else:
+            laporan_sukses.append({
+                "nim": nim,
+                "nama": nama,
+                "foto_valid": foto_berhasil_hitung,
+                "foto_gagal": foto_gagal_hitung
+            })
+
+    # ==================== LAPORAN REKAPITULASI ====================
+    print("\n" + "=" * 65)
+    print(" LAPORAN REKAPITULASI REGISTRASI WAJAH")
+    print("=" * 65)
+    print(f" Total Mahasiswa Berhasil : {len(laporan_sukses)}")
+    for s in laporan_sukses:
+        id_str = f" [ID: {s['id_datawajah']}]" if "id_datawajah" in s else ""
+        print(f"  [+] NIM {s['nim']} - {s['nama']}{id_str} (Foto valid: {s['foto_valid']})")
+
+    print(f"\n Total Mahasiswa Gagal    : {len(laporan_gagal)}")
+    for g in laporan_gagal:
+        print(f"  [-] NIM {g['nim']} : {g['alasan']}")
+    print("=" * 65)
+
+    return laporan_sukses, laporan_gagal
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Registrasi Wajah Mahasiswa ke PostgreSQL")
+    parser.add_argument("--folder", type=str, default=None, help="Folder dataset foto mahasiswa")
+    parser.add_argument("--dry-run", action="store_true", help="Uji tanpa menyimpan ke PostgreSQL")
+    args = parser.parse_args()
+
+    registrasi_dataset_wajah(folder_dataset=args.folder, simpan_ke_db=not args.dry_run)

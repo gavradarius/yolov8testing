@@ -1,29 +1,44 @@
-import cv2
+"""
+Sistem Pengenalan Wajah & Absensi Mahasiswa Menggunakan Webcam
+Terintegrasi Penuh dengan Database PostgreSQL:
+- Mengambil face embedding dan data mahasiswa dari t_datawajah JOIN t_mahasiswa
+- Menghitung Cosine Similarity
+- Jika cocok (skor >= threshold): menampilkan Nama, NIM, dan skor
+- Jika tidak cocok: menampilkan 'MAHASISWA TIDAK DIKENAL'
+- Memeriksa jadwal kuliah aktif di t_jadwal:
+  * Jika jadwal aktif tersedia: catat absensi otomatis ke t_absensi
+  * Jika jadwal belum tersedia: tampilkan peringatan dan JANGAN melakukan INSERT
+- Mencegah absensi duplikat
+"""
+
+import os
+import sys
 import time
 import math
-import os
+import cv2
 import numpy as np
-import psycopg2
 import onnxruntime as ort
 from insightface.app import FaceAnalysis
 
-# ================= 1. KONFIGURASI SISTEM =================
-# Threshold dilonggarkan agar saat ganti ekspresi (senyum/mangap) tetap dikenali
-THRESHOLD_UJI = 0.55
-MINIMAL_SELISIH = 0.05
+import config
+from database import (
+    get_connection,
+    close_connection,
+    get_face_data,
+    save_absensi,
+    dapatkan_jadwal_aktif,
+    test_connection
+)
 
-# Konfigurasi Geofencing (Radius Absensi)
-KELAS_LAT = -6.9828        # Contoh latitude kelas
-KELAS_LON = 110.4091       # Contoh longitude kelas
-BATAS_RADIUS_METER = 50    # Maksimal jarak absen dari titik kelas (meter)
-
-# MOCKUP GPS: Ubah angka ini untuk mengetes sistem menolak atau menerima jarakmu
-GPS_MAHASISWA_SAAT_INI = (-6.9828, 110.4091)
+# Cooldown absensi lokal untuk anti-spam antar frame
+riwayat_absen_terakhir = {}  # {nim: timestamp}
+pesan_notifikasi_absen = ""
+warna_notifikasi = (0, 180, 0)
+waktu_tampil_notifikasi = 0
 
 
-# ================= 2. FUNGSI PEMBANTU =================
 def hitung_jarak_meter(lat1, lon1, lat2, lon2):
-    """Menghitung jarak dua titik koordinat bumi dalam meter (Rumus Haversine)"""
+    """Menghitung jarak dua titik koordinat bumi dalam meter (Rumus Haversine)."""
     R = 6371000
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     delta_phi = math.radians(lat2 - lat1)
@@ -32,167 +47,281 @@ def hitung_jarak_meter(lat1, lon1, lat2, lon2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
+
 def cek_wajah_asli_dasar(wajah_bgr):
-    """Metode cadangan deteksi layar HP/kertas jika model ONNX belum ada"""
+    """Metode cadangan deteksi layar HP/kertas jika model anti-spoofing belum ada."""
     abu_abu = cv2.cvtColor(wajah_bgr, cv2.COLOR_BGR2GRAY)
     tekstur = cv2.Laplacian(abu_abu, cv2.CV_64F).var()
     return 20 <= tekstur <= 1500
 
 
-# ================= 3. PERSIAPAN DATABASE & AI =================
-print("1. Menghubungkan ke PostgreSQL...")
-try:
-    koneksi = psycopg2.connect(
-        host="10.137.197.64", database="postgres", user="postgres", password=os.environ["DB_PASSWORD"], port="5432"
-    )
-    kursor = koneksi.cursor()
-    kursor.execute('''
-        SELECT m.nim, m.nama, p.nama_prodi, m.vektor_wajah
-        FROM mahasiswa m JOIN prodi p ON m.prodi_id = p.id_prodi
-    ''')
-    data_mahasiswa = kursor.fetchall()
-    koneksi.close()
-except Exception as e:
-    raise SystemExit(f"Gagal terhubung ke database: {e}")
+def main():
+    global pesan_notifikasi_absen, warna_notifikasi, waktu_tampil_notifikasi
 
-referensi = []
-for baris in data_mahasiswa:
-    referensi.append({
-        "nim": baris[0], "nama": baris[1], "prodi": baris[2],
-        "embedding": np.frombuffer(baris[3], dtype=np.float32)
-    })
-print(f"Berhasil memuat {len(referensi)} data.")
+    print("=" * 68)
+    print(" SISTEM ABSENSI PENGENALAN WAJAH MAHASISWA (POSTGRESQL & WEBCAM)")
+    print("=" * 68)
 
-print("2. Memuat AI Pengenalan Wajah (InsightFace) di GPU...")
-app = FaceAnalysis(name="buffalo_l", providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-app.prepare(ctx_id=0, det_size=(640, 640))
+    # 1. Uji koneksi ke PostgreSQL
+    terhubung, pesan_db, _ = test_connection()
+    if not terhubung:
+        print(f"\n[ERROR] Database PostgreSQL tidak terhubung: {pesan_db}")
+        print("Pastikan PostgreSQL aktif dan pengaturan di .env sudah sesuai.")
+        return
 
-print("3. Memuat AI Anti-Spoofing (Passive Liveness)...")
-FILE_MODEL_SPOOF = "antispoof.onnx"
-pakai_ai_spoof = False
-if os.path.exists(FILE_MODEL_SPOOF):
-    try:
-        # Muat file Anti-Spoofing ke dalam GPU
-        spoof_ai = ort.InferenceSession(FILE_MODEL_SPOOF, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-        pakai_ai_spoof = True
-        print("[BERHASIL] AI Liveness (Anti-Spoofing) terdeteksi & aktif!")
-    except Exception as e:
-        print(f"[PERINGATAN] Gagal memuat antispoof.onnx: {e}")
-else:
-    print("[PERINGATAN] File 'antispoof.onnx' belum diunduh. Sistem memakai filter perlindungan dasar.")
+    print(f" [+] Status Database: {pesan_db}")
 
+    # 2. Muat data wajah dari PostgreSQL
+    referensi = get_face_data()
+    print(f" [+] Berhasil memuat {len(referensi)} identitas wajah dari tabel t_datawajah.")
+    if not referensi:
+        print(" [PERINGATAN] Tabel t_datawajah masih kosong! Jalankan registrasi_wajah.py terlebih dahulu.")
 
-# ================= 4. PROSES UTAMA (LOOP KAMERA) =================
-# Hitung jarak sebelum kamera dibuka (karena ini masih GPS Statis/Mockup)
-jarak_mahasiswa = hitung_jarak_meter(GPS_MAHASISWA_SAAT_INI[0], GPS_MAHASISWA_SAAT_INI[1], KELAS_LAT, KELAS_LON)
-
-kamera = cv2.VideoCapture(0)
-if not kamera.isOpened():
-    raise SystemExit("Kamera tidak bisa dibuka.")
-
-cv2.namedWindow("Sistem Absensi Final", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("Sistem Absensi Final", 800, 600)
-prev_time = time.time()
-
-while True:
-    berhasil, frame = kamera.read()
-    if not berhasil: break
-
-    frame = cv2.flip(frame, 1)
-
-    # ----------------------------------------------------
-    # TAHAP 1: VALIDASI JARAK LOKASI
-    # ----------------------------------------------------
-    if jarak_mahasiswa > BATAS_RADIUS_METER:
-        cv2.putText(frame, f"DITOLAK! Jarak Anda: {jarak_mahasiswa:.1f} Meter dari Kelas", (20, frame.shape[0] // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-        cv2.putText(frame, "(Masuk ke area kelas 50m untuk absen)", (20, (frame.shape[0] // 2) + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+    # 3. Periksa ketersediaan jadwal aktif
+    jadwal_aktif = dapatkan_jadwal_aktif()
+    if jadwal_aktif:
+        id_jadwal_aktif = jadwal_aktif["id_jadwal"]
+        matkul_aktif = jadwal_aktif.get("nama_matkul", "")
+        ruang_aktif = jadwal_aktif.get("ruang_kelas", "")
+        print(f" [+] Jadwal Kuliah Aktif: {id_jadwal_aktif} - {matkul_aktif} (Ruang: {ruang_aktif})")
     else:
+        id_jadwal_aktif = None
+        print(" [INFO] Tidak ada jadwal kuliah yang aktif saat ini di tabel t_jadwal.")
+        print("        Sistem HANYA akan melakukan verifikasi identitas (TIDAK ADA INSERT ABSENSI).")
+
+    print(f" [+] Ambang Kemiripan (Similarity Threshold): {config.SIMILARITY_THRESHOLD}")
+
+    # 4. Inisialisasi AI Face Recognition (InsightFace)
+    print("\n[+] Memuat AI Face Recognition (InsightFace buffalo_l)...")
+    app = FaceAnalysis(
+        name="buffalo_l",
+        root=str(config.MODELS_CACHE_DIR),
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+    )
+    app.prepare(ctx_id=-1, det_size=(config.DETECTION_SIZE, config.DETECTION_SIZE))
+
+    # 5. Inisialisasi AI Anti-Spoofing (Passive Liveness)
+    pakai_ai_spoof = False
+    if config.MODEL_ANTISPOOF.exists():
+        try:
+            spoof_ai = ort.InferenceSession(str(config.MODEL_ANTISPOOF), providers=["CPUExecutionProvider"])
+            pakai_ai_spoof = True
+            print("[+] Model Anti-Spoofing aktif!")
+        except Exception as e:
+            print(f"[!] Gagal memuat antispoof.onnx: {e}")
+    else:
+        print("[!] File antispoof.onnx belum ada. Menggunakan filter tekstur dasar.")
+
+    # 6. Validasi Geofencing
+    jarak_mahasiswa = hitung_jarak_meter(
+        config.GPS_MOCK_LAT, config.GPS_MOCK_LON,
+        config.KELAS_LAT, config.KELAS_LON
+    )
+
+    # 7. Membuka Kamera Webcam
+    print("\n[+] Membuka kamera webcam... (Tekan 'q' pada jendela video untuk keluar)")
+    kamera = cv2.VideoCapture(0)
+    if not kamera.isOpened():
+        print("[ERROR] Kamera webcam tidak dapat dibuka atau tidak terdeteksi.")
+        return
+
+    cv2.namedWindow("Sistem Absensi Mahasiswa - YOLO & PostgreSQL", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Sistem Absensi Mahasiswa - YOLO & PostgreSQL", 960, 680)
+    prev_time = time.time()
+
+    while True:
+        berhasil, frame = kamera.read()
+        if not berhasil:
+            print("[!] Gagal membaca frame dari webcam.")
+            break
+
+        frame = cv2.flip(frame, 1)
+        waktu_sekarang = time.time()
+
         # ----------------------------------------------------
-        # TAHAP 2: EKSEKUSI WAJAH GPU (LINEAR)
+        # TAHAP 1: VALIDASI GEOFENCING
         # ----------------------------------------------------
-        wajah_terdeteksi = app.get(frame)
-
-        if len(wajah_terdeteksi) > 0:
-            wajah_utama = max(wajah_terdeteksi, key=lambda w: (w.bbox[2] - w.bbox[0]) * (w.bbox[3] - w.bbox[1]))
-            x1, y1, x2, y2 = map(int, wajah_utama.bbox)
-
-            # Potong bagian wajah dari gambar keseluruhan
-            wajah_crop = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
-            is_asli = False
-
+        if jarak_mahasiswa > config.BATAS_RADIUS_METER:
+            cv2.putText(
+                frame,
+                f"DITOLAK! Jarak Anda: {jarak_mahasiswa:.1f}m dari Ruang Kelas",
+                (20, frame.shape[0] // 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 0, 255),
+                2
+            )
+            cv2.putText(
+                frame,
+                f"(Maksimal radius absensi: {config.BATAS_RADIUS_METER:.0f}m)",
+                (20, (frame.shape[0] // 2) + 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 165, 255),
+                2
+            )
+        else:
             # ----------------------------------------------------
-            # TAHAP 3: PASSIVE LIVENESS / ANTI-SPOOFING
+            # TAHAP 2: DETEKSI WAJAH
             # ----------------------------------------------------
-            if wajah_crop.size > 0:
-                if pakai_ai_spoof:
-                    try:
-                        # Siapkan format gambar untuk model MiniFASNet (80x80)
-                        blob = cv2.dnn.blobFromImage(wajah_crop, 1.0/255.0, (80, 80), (0, 0, 0), swapRB=True, crop=False)
-                        nama_input = spoof_ai.get_inputs()[0].name
-                        hasil_spoof = spoof_ai.run(None, {nama_input: blob})[0]
+            wajah_terdeteksi = app.get(frame)
 
-                        kelas_terdeteksi = np.argmax(hasil_spoof)
-                        skor_asli = hasil_spoof[0][1] # Asumsi index 1 adalah 'Wajah Nyata 3D'
+            if len(wajah_terdeteksi) > 0:
+                # Ambil wajah utama terbesar
+                wajah_utama = max(wajah_terdeteksi, key=lambda w: (w.bbox[2] - w.bbox[0]) * (w.bbox[3] - w.bbox[1]))
+                x1, y1, x2, y2 = map(int, wajah_utama.bbox)
 
-                        is_asli = True if (kelas_terdeteksi == 1 and skor_asli > 0.80) else False
-                    except:
-                        is_asli = cek_wajah_asli_dasar(wajah_crop) # Mundur ke filter dasar jika struktur ONNX berbeda
-                else:
-                    is_asli = cek_wajah_asli_dasar(wajah_crop)
+                wajah_crop = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
+                is_asli = False
 
-            # ----------------------------------------------------
-            # TAHAP 4: PENCOCOKAN IDENTITAS (Hanya jika Lolos Spoof)
-            # ----------------------------------------------------
-            if not is_asli:
-                nama_tampil = "LAYAR HP / PALSU"
-                warna = (0, 0, 255)
-                skor_tampil = 0.0
-            else:
-                embedding_kamera = wajah_utama.normed_embedding
-                skor_identitas = {}
-
-                for ref in referensi:
-                    skor = float(np.dot(embedding_kamera, ref["embedding"]))
-                    nim = ref["nim"]
-                    if nim not in skor_identitas or skor > skor_identitas[nim]["skor"]:
-                        skor_identitas[nim] = {"nama": ref["nama"], "skor": skor}
-
-                urutan = sorted(skor_identitas.items(), key=lambda item: item[1]["skor"], reverse=True)
-
-                if urutan:
-                    _, terbaik = urutan[0]
-                    skor_tertinggi = terbaik["skor"]
-
-                    if skor_tertinggi < THRESHOLD_UJI:
-                        nama_tampil = "TIDAK DIKENALI"
-                        warna = (0, 0, 255)
+                # ----------------------------------------------------
+                # TAHAP 3: ANTI-SPOOFING (LIVENESS)
+                # ----------------------------------------------------
+                if wajah_crop.size > 0:
+                    if pakai_ai_spoof:
+                        try:
+                            blob = cv2.dnn.blobFromImage(
+                                wajah_crop, 1.0 / 255.0, (80, 80), (0, 0, 0), swapRB=True, crop=False
+                            )
+                            nama_input = spoof_ai.get_inputs()[0].name
+                            hasil_spoof = spoof_ai.run(None, {nama_input: blob})[0]
+                            kelas_deteksi = np.argmax(hasil_spoof)
+                            skor_asli = hasil_spoof[0][1]
+                            is_asli = True if (kelas_deteksi == 1 and skor_asli > 0.80) else False
+                        except Exception:
+                            is_asli = cek_wajah_asli_dasar(wajah_crop)
                     else:
-                        nama_tampil = f"{terbaik['nama']}"
-                        warna = (0, 255, 0)
-                    skor_tampil = skor_tertinggi
-                else:
-                    nama_tampil = "TIDAK DIKENALI"
+                        is_asli = cek_wajah_asli_dasar(wajah_crop)
+
+                # ----------------------------------------------------
+                # TAHAP 4: PENCOCOKAN IDENTITAS & ABSENSI
+                # ----------------------------------------------------
+                if not is_asli:
+                    nama_tampil = "LAYAR HP / PALSU"
+                    nim_tampil = ""
                     warna = (0, 0, 255)
                     skor_tampil = 0.0
+                else:
+                    embedding_kamera = wajah_utama.normed_embedding
+                    skor_identitas = {}
 
-            # Gambar Kotak Bounding Box Akhir
-            cv2.rectangle(frame, (x1, y1), (x2, y2), warna, 2)
-            teks = f"{nama_tampil} ({skor_tampil:.2f})" if nama_tampil not in ["TIDAK DIKENALI", "LAYAR HP / PALSU"] else nama_tampil
-            cv2.putText(frame, teks, (x1, max(25, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, warna, 2)
+                    # Bandingkan dengan referensi embedding dari t_datawajah
+                    for ref in referensi:
+                        skor = float(np.dot(embedding_kamera, ref["embedding"]))
+                        nim_ref = ref["nim"]
+                        if nim_ref not in skor_identitas or skor > skor_identitas[nim_ref]["skor"]:
+                            skor_identitas[nim_ref] = {
+                                "nim": nim_ref,
+                                "nama": ref["nama"],
+                                "prodi": ref["prodi"],
+                                "skor": skor
+                            }
 
-    # ----------------------------------------------------
-    # TAHAP 5: TAMPILAN DASHBOARD POJOK KIRI ATAS
-    # ----------------------------------------------------
-    curr_time = time.time()
-    fps = 1 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 0
-    prev_time = curr_time
+                    urutan = sorted(skor_identitas.items(), key=lambda item: item[1]["skor"], reverse=True)
 
-    teks_info = f"FPS: {fps:.1f} | Jarak: {jarak_mahasiswa:.1f}m | Anti-Spoof: {'AI (ONNX)' if pakai_ai_spoof else 'Dasar (Laplacian)'}"
-    cv2.putText(frame, teks_info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    if urutan:
+                        nim_terpilih, terbaik = urutan[0]
+                        skor_tertinggi = terbaik["skor"]
 
-    cv2.imshow("Sistem Absensi Final", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+                        # Evaluasi ambang batas kemiripan
+                        if skor_tertinggi < config.SIMILARITY_THRESHOLD:
+                            nama_tampil = "MAHASISWA TIDAK DIKENAL"
+                            nim_tampil = ""
+                            warna = (0, 0, 255)  # Merah
+                        else:
+                            # Terverifikasi Cocok
+                            nama_tampil = terbaik["nama"]
+                            nim_tampil = f"NIM: {terbaik['nim']}"
+                            warna = (0, 255, 0)  # Hijau
 
-kamera.release()
-cv2.destroyAllWindows()
+                            # PENCATATAN ABSENSI
+                            terakhir_absen = riwayat_absen_terakhir.get(nim_terpilih, 0)
+                            if (waktu_sekarang - terakhir_absen) > config.COOLDOWN_ABSEN_DETIK:
+                                if id_jadwal_aktif:
+                                    try:
+                                        hasil_absen = save_absensi(
+                                            nim=nim_terpilih,
+                                            id_jadwal=id_jadwal_aktif,
+                                            status_kehadiran="Hadir",
+                                            cek_duplikasi=True
+                                        )
+                                        riwayat_absen_terakhir[nim_terpilih] = waktu_sekarang
+
+                                        if hasil_absen["status"] == "berhasil":
+                                            pesan_notifikasi_absen = f"[BERHASIL HADIR] {terbaik['nama']} ({nim_terpilih}) | ID: {hasil_absen['id_absensi']}"
+                                            warna_notifikasi = (0, 180, 0)
+                                            print(f" [DB INSERT] {pesan_notifikasi_absen}")
+                                        else:
+                                            pesan_notifikasi_absen = f"[INFO] {terbaik['nama']} sudah tercatat hadir hari ini."
+                                            warna_notifikasi = (0, 165, 255)
+                                            print(f" [DB INFO] {pesan_notifikasi_absen}")
+
+                                        waktu_tampil_notifikasi = waktu_sekarang + 4.0
+                                    except Exception as err:
+                                        pesan_notifikasi_absen = f"[DB ERROR] Gagal catat absensi: {err}"
+                                        warna_notifikasi = (0, 0, 255)
+                                        print(f" [DB ERROR] {pesan_notifikasi_absen}")
+                                        waktu_tampil_notifikasi = waktu_sekarang + 4.0
+                                else:
+                                    # JADWAL TIDAK TERSEDIA -> JANGAN INSERT
+                                    pesan_notifikasi_absen = f"[PERINGATAN] {terbaik['nama']} dikenali, tapi TIDAK ADA JADWAL KULIAH AKTIF (Absensi tidak dicatat)."
+                                    warna_notifikasi = (0, 140, 255)
+                                    print(f" [JADWAL KOSONG] {pesan_notifikasi_absen}")
+                                    waktu_tampil_notifikasi = waktu_sekarang + 4.0
+
+                        skor_tampil = skor_tertinggi
+                    else:
+                        nama_tampil = "MAHASISWA TIDAK DIKENAL"
+                        nim_tampil = ""
+                        warna = (0, 0, 255)
+                        skor_tampil = 0.0
+
+                # Gambar Bounding Box
+                cv2.rectangle(frame, (x1, y1), (x2, y2), warna, 2)
+
+                # Format label teks
+                if nama_tampil == "MAHASISWA TIDAK DIKENAL":
+                    teks_label = f"{nama_tampil} ({skor_tampil:.2f})"
+                elif nim_tampil:
+                    teks_label = f"{nama_tampil} | {nim_tampil} | Sim: {skor_tampil:.2f}"
+                else:
+                    teks_label = nama_tampil
+
+                cv2.putText(frame, teks_label, (x1, max(25, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, warna, 2)
+
+        # ----------------------------------------------------
+        # TAHAP 5: BANNER STATUS NOTIFIKASI
+        # ----------------------------------------------------
+        if waktu_sekarang < waktu_tampil_notifikasi and pesan_notifikasi_absen:
+            cv2.rectangle(frame, (10, frame.shape[0] - 60), (frame.shape[1] - 10, frame.shape[0] - 10), warna_notifikasi, -1)
+            cv2.putText(
+                frame,
+                pesan_notifikasi_absen,
+                (20, frame.shape[0] - 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.60,
+                (255, 255, 255),
+                2
+            )
+
+        # ----------------------------------------------------
+        # TAHAP 6: HEADER STATUS
+        # ----------------------------------------------------
+        curr_time = time.time()
+        fps = 1 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 0
+        prev_time = curr_time
+
+        jadwal_str = f"Jadwal: {id_jadwal_aktif}" if id_jadwal_aktif else "Jadwal: Tidak Ada"
+        teks_info = f"FPS: {fps:.1f} | {jadwal_str} | Threshold: {config.SIMILARITY_THRESHOLD:.2f}"
+        cv2.putText(frame, teks_info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+
+        cv2.imshow("Sistem Absensi Mahasiswa - YOLO & PostgreSQL", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    kamera.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
